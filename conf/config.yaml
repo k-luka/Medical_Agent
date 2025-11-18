@@ -1,0 +1,19 @@
+defaults:
+  - llm: gemini
+  - _self_
+
+work_dir: ${hydra:runtime.cwd}
+
+llm:
+  model_id: gemini-2.5-flash
+  temperature: 0.0
+
+model:
+  checkpoint_path: checkpoints/model.pth
+  device: cuda
+
+tools:
+  segmentation: true
+
+ui:
+  type: cli
