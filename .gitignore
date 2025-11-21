@@ -1,3 +1,5 @@
 .env
 models/
 data/
+outputs/
+__pycache__/

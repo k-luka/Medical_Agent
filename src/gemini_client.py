@@ -1,48 +1,61 @@
 import os
 from google import genai
 from google.genai import types
-from tools.test_func_call import segment_image
+import hydra
+import warnings
+from omegaconf import DictConfig
+# tools
+from src.tools.inference import load_models_from_hydra
+from src.tools.defenitions import segment_spleen_ct, segment_brain_mri
 
-# def get_client():
-#     api_key = os.environ.get("GEMINI_API_KEY")
-#     if not api_key:
-#         raise ValueError("API key not found in environment variables.")
+warnings.filterwarnings("ignore", module="monai")
+import logging
 
-#     return genai.Client(api_key=api_key)
+logging.getLogger("google_genai.models").setLevel(logging.WARNING)
+logging.getLogger("httpx").setLevel(logging.WARNING)
 
-# def run_gemini(prompt: str, model_id="gemini-2.5-flash", temperature: float = 0.0):
-#     client = get_client()
+@hydra.main(version_base=None, config_path="../conf", config_name="config")
+def main(cfg: DictConfig):
+    print(f"--- Starting Medical Agent (UI: {cfg.ui.type}) ---")
 
-#     response = client.models.generate_content(
-#         model=model_id,
-#         contents=prompt,
-#         config=types.GenerateContentConfig(
-#             temperature=temperature
-#         )
-#     )
-#     return response.text
+    # load models
+    load_models_from_hydra(cfg)
 
-def main():
+    if "GEMINI_API_KEY" not in os.environ:
+        raise ValueError("GEMINI_API_KEY not found in environment variables.")
+
+    # create the client
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
-    # Create the config
-    # We pass the actual python fucntion into 'tools'.
-    # We set 'automatic_function_calling' to NOT disabled
-    config = types.GenerateContentConfig(
-        tools = [segment_image],
-        automatic_function_calling = types.AutomaticFunctionCallingConfig(disable=False)
+    # define tools
+    my_tools = [segment_spleen_ct, segment_brain_mri]
+
+    generate_config = types.GenerateContentConfig(
+        temperature=cfg.llm.temperature,
+        tools=my_tools,
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=False),
     )
 
-    # Make one call
-    response = client.models.generate_content(
-        model = "gemini-2.5-flash",
-        contents = "Segment the liver in /tmp/example_ct.nii.gz and explain the result.",
-        config = config,
-    )
+    chat = client.chats.create(model=cfg.llm.model_id, config=generate_config)
 
-    print("Agent Response:", response.text)
+    print("---------------------------------------")
+    print("+++ Agent Ready. Models are loaded. +++")
+
+    while True:
+        try:
+            user_input = input("\n> User: ")
+            if user_input.lower() in ["exit", "quit"]:
+                print("Exiting Medical Agent. Goodbye!")
+                break
+            
+            response = chat.send_message(user_input)
+            print(f"\n> Agent: {response.text}")
+
+        except KeyboardInterrupt:
+            break
+        except Exception as e:
+            print(f"Error: {e}")
 
 if __name__ == "__main__":
     main()
-
 
