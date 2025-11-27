@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 from google import genai
 from google.genai import types
 import hydra
@@ -6,7 +7,14 @@ import warnings
 from omegaconf import DictConfig
 # tools
 from src.tools.inference import load_models_from_hydra
-from src.tools.defenitions import segment_spleen_ct, segment_brain_mri
+from src.tools.defenitions import (
+    segment_spleen_ct,
+    segment_multi_organ_ct,
+    lung_nodule_ct_detection,
+    inspect_segmentation_tool,
+    view_saved_slice,
+    init_analysis,
+)
 
 warnings.filterwarnings("ignore", module="monai")
 import logging
@@ -20,6 +28,7 @@ def main(cfg: DictConfig):
 
     # load models
     load_models_from_hydra(cfg)
+    init_analysis(Path(cfg.sandbox.path))
 
     if "GEMINI_API_KEY" not in os.environ:
         raise ValueError("GEMINI_API_KEY not found in environment variables.")
@@ -28,12 +37,20 @@ def main(cfg: DictConfig):
     client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
 
     # define tools
-    my_tools = [segment_spleen_ct, segment_brain_mri]
+    my_tools = [
+        segment_spleen_ct, 
+        # segment_brain_mri,
+        segment_multi_organ_ct,
+        lung_nodule_ct_detection,
+        inspect_segmentation_tool,
+        view_saved_slice,
+    ]
 
     generate_config = types.GenerateContentConfig(
         temperature=cfg.llm.temperature,
         tools=my_tools,
         automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=False),
+        system_instruction = cfg.llm.system_prompt
     )
 
     chat = client.chats.create(model=cfg.llm.model_id, config=generate_config)
@@ -58,4 +75,3 @@ def main(cfg: DictConfig):
 
 if __name__ == "__main__":
     main()
-

@@ -1,279 +1,193 @@
-import os
-import torch
+import json
+import logging
 import traceback
-from monai.bundle import ConfigParser
-from monai.data import DataLoader, Dataset, decollate_batch
-from monai.transforms import SaveImage, EnsureChannelFirstd, Compose
+from pathlib import Path
+import numpy as np
+import torch
+from typing import Any, Dict, List, cast
 
-MODEL_REGISTRY = {}
+from monai.bundle.config_parser import ConfigParser
+from monai.data.dataloader import DataLoader
+from monai.data.dataset import Dataset
+from monai.data.utils import decollate_batch 
+from monai.transforms.compose import Compose
+from monai.transforms.io.array import SaveImage
 
 
+# Configure logging
+logger = logging.getLogger(__name__)
+
+# --- 1. Base Class (Shared Logic) ---
 class MedicalModel:
     def __init__(self, name: str, bundle_name: str, root_dir: str, device: str = "cuda"):
         self.name = name
-        self.device = torch.device(device if torch.cuda.is_available() else "cpu")
+        self.device = device
+        self.bundle_path = Path(root_dir) / bundle_name
+        self.config_path = self.bundle_path / "configs" / "inference.json"
 
-        self.bundle_path = os.path.join(root_dir, bundle_name)
-        self.config_path = os.path.join(self.bundle_path, "configs", "inference.json")
+        if not self.config_path.exists():
+            raise FileNotFoundError(f"Bundle config not found at {self.config_path}")
 
         self.parser = ConfigParser()
-        self.parser.read_config(self.config_path)
+        self.parser.read_config(str(self.config_path))
 
-        self.pre_transforms = self.parser.get_parsed_content("preprocessing")
-        self.post_transforms = self.parser.get_parsed_content("postprocessing")
-
-        # Laod model
-        print(f"⚡️ Loading model '{name}' to {self.device} ")
-        self.network = self.parser.get_parsed_content("network").to(self.device)
-
-        # Load weights
-        ckpt_path = os.path.join(self.bundle_path, "models" , "model.pt")
-        if os.path.exists(ckpt_path):
-            checkpoint = torch.load(ckpt_path, map_location=self.device)
-            self.network.load_state_dict(checkpoint.get("model", checkpoint))
-            print(f"    ✅ Weights loaded for '{name}' model.")
-        else:
-            print(f"    No checkpoint found at {ckpt_path} for '{name}' model.")
-        
-        self.network.eval()
+        self.network = self._load_network()
         self.inferer = self.parser.get_parsed_content("inferer")
+        self.pre_transforms = self.parser.get_parsed_content("preprocessing")
+        self.post_transforms = self._load_post_transforms()
+
+    def _load_network(self) -> torch.nn.Module:
+        print(f"⚡️ Loading model '{self.name}'...")
+        # Patch for 'img_size' error in older bundles
+        network_config = self.parser.get("network")
+        if "img_size" in network_config:
+            network_config.pop("img_size")
+            self.parser["network"] = network_config
+
+        network = self.parser.get_parsed_content("network").to(self.device)
+        
+        ckpt_path = self.bundle_path / "models" / "model.pt"
+        if ckpt_path.exists():
+            checkpoint = torch.load(ckpt_path, map_location=self.device)
+            state_dict = checkpoint.get("model", checkpoint) if isinstance(checkpoint, dict) else checkpoint
+            network.load_state_dict(state_dict)
+        else:
+            print(f"⚠️ Warning: No checkpoint found for {self.name}")
+        
+        network.eval()
+        return network
+
+    def _load_post_transforms(self) -> Compose:
+        transforms = self.parser.get_parsed_content("postprocessing")
+        return transforms if isinstance(transforms, Compose) else Compose([])
+
+    # Explicit return type 'str' fixes the inheritance conflict
+    def predict(self, file_path: str) -> str:
+        raise NotImplementedError("Subclasses must implement predict()")
+
+
+# --- 2. Segmentation Subclass ---
+class SegmentationModel(MedicalModel):
+    def _load_post_transforms(self) -> Compose:
+        transforms = self.parser.get_parsed_content("postprocessing")
+        if isinstance(transforms, Compose):
+            # Remove SaveImage so we can handle saving manually
+            clean = [t for t in transforms.transforms if "Save" not in type(t).__name__]
+            return Compose(clean)
+        return transforms
 
     def predict(self, file_path: str) -> str:
-        if not os.path.exists(file_path):
-            return f"Error: File not found at {file_path}"
-    
-        output_dir = os.path.dirname(file_path)
-
-        data = [{"image": file_path}]
-        ds = Dataset(data=data, transform=self.pre_transforms)
-        loader = DataLoader(ds, batch_size=1)
+        path = Path(file_path)
+        output_dir = path.parent
+        
+        # Prepare Data
+        ds = Dataset(data=[{"image": str(path)}], transform=self.pre_transforms)
+        loader = DataLoader(ds, batch_size=1, num_workers=0)
 
         with torch.no_grad():
             for batch in loader:
                 images = batch["image"].to(self.device)
-                outputs = self.inferer(inputs=images, network=self.network)
-                batch["pred"] = outputs
+                batch["pred"] = self.inferer(inputs=images, network=self.network)
                 
-                items = decollate_batch(batch)
+                # --- FIX: Explicit Cast for Type Checker ---
+                items = cast(List[Dict[str, Any]], decollate_batch(batch))
+
                 for item in items:
-                    # Post-processing
-                    for t in self.post_transforms.transforms:
-                        if "Save" in type(t).__name__:
-                            continue
-                        item = t(item)
-                    
-                    mask_tensor = item["pred"]
-
-                    # if multi chennl, flatten
-                    if mask_tensor.shape[0] > 1:
-                        mask_tensor = torch.argmax(mask_tensor, dim=0, keepdim=True)
-                    
-                    # Make sure mask is uint8
-                    if mask_tensor.dtype != torch.uint8:
-                        mask_tensor = (mask_tensor > 0.5).to(torch.uint8)
-                    
-                    # Save resuults
-                    saver = SaveImage(
-                        output_dir=output_dir,
-                        output_postfix="seg",
-                        output_ext=".nii.gz",
-                        separate_folder=False,
-                        print_log=False,
-                        output_dtype=torch.uint8
-                    )
-
-                    meta = item.get("pred_meta_dict") or item.get("image_meta_dict")
-                    saver(mask_tensor, meta_data=meta)
+                    self._save_mask(item, output_dir)
         
         return f"Segmentation complete. Mask saved in {output_dir}"
+
+    def _save_mask(self, item: Dict[str, Any], output_dir: Path):
+        if self.post_transforms:
+            item = cast(Dict[str, Any], self.post_transforms(item))
+        
+        mask = item["pred"]
+        # Argmax if multi-channel (Multi-organ)
+        if mask.shape[0] > 1: 
+            mask = torch.argmax(mask, dim=0, keepdim=True)
+        
+        # Ensure uint8
+        if mask.dtype != torch.uint8:
+             mask = mask.to(torch.uint8)
+
+        saver = SaveImage(output_dir=str(output_dir), output_postfix="seg", output_ext=".nii.gz", 
+                          separate_folder=False, print_log=False, output_dtype=np.uint8)
+        saver(mask, meta_data=item.get("image_meta_dict"))
+
+
+# --- 3. Detection Subclass ---
+class DetectionModel(MedicalModel):
+    def predict(self, file_path: str) -> str:
+        path = Path(file_path)
+        output_json = path.parent / f"{path.stem}_detection.json"
+        
+        ds = Dataset(data=[{"image": str(path)}], transform=self.pre_transforms)
+        loader = DataLoader(ds, batch_size=1, num_workers=0)
+
+        results = []
+        with torch.no_grad():
+            for batch in loader:
+                images = batch["image"].to(self.device)
+                
+                # 1. Inference
+                batch["pred"] = self.inferer(inputs=images, network=self.network)
+                
+                # --- FIX: Explicit Cast for Type Checker ---
+                items = cast(List[Dict[str, Any]], decollate_batch(batch))
+
+                # 3. Post-Processing
+                for item in items:
+                    if self.post_transforms:
+                        item = cast(Dict[str, Any], self.post_transforms(item))
+                    
+                    # 4. Extract Results
+                    if "box" in item and "label" in item and "score" in item:
+                        boxes = item["box"].cpu().numpy().tolist()
+                        scores = item["score"].cpu().numpy().tolist()
+                        labels = item["label"].cpu().numpy().tolist()
+                        
+                        detections = []
+                        for b, s, l in zip(boxes, scores, labels):
+                            if s > 0.10: # Confidence Threshold
+                                detections.append({
+                                    "box": b, 
+                                    "score": s, 
+                                    "label": int(l)
+                                })
+                        
+                        results.append({
+                            "file": str(path),
+                            "detections": detections
+                        })
+
+        # Save Report
+        with open(output_json, "w") as f:
+            json.dump(results, f, indent=4)
             
+        return f"Detection complete. Found {len(results[0]['detections']) if results else 0} items. Saved to {output_json}"
+
+
+# --- 4. Factory Logic ---
+MODEL_REGISTRY = {}
 
 def load_models_from_hydra(cfg):
     root = cfg.medical_models.bundle_root
     device = cfg.medical_models.device
+    
     for friendly_name, bundle_name in cfg.medical_models.active_bundles.items():
         try:
-            model = MedicalModel(friendly_name, bundle_name, root, device)
+            # Simple heuristic
+            if "detection" in bundle_name.lower():
+                model = DetectionModel(friendly_name, bundle_name, root, device)
+            else:
+                model = SegmentationModel(friendly_name, bundle_name, root, device)
+                
             MODEL_REGISTRY[friendly_name] = model
+            print(f"✅ Registered '{friendly_name}' as {type(model).__name__}")
         except Exception as e:
-            print(f"Nope: Failed to load model '{friendly_name}': {e}")
+            print(f"❌ Failed to load '{friendly_name}': {e}")
             traceback.print_exc()
 
 def get_model(name: str):
     return MODEL_REGISTRY.get(name)
 
-
-# class MedicalModel:
-#     def __init__(self, name: str, bundle_name: str, root_dir: str, device: str = "cuda"):
-#         self.name = name
-#         self.device = torch.device(device if torch.cuda.is_available() else "cpu")
-        
-#         self.bundle_path = os.path.join(root_dir, bundle_name)
-#         self.config_path = os.path.join(self.bundle_path, "configs", "inference.json")
-
-#         self.parser = ConfigParser()
-#         self.parser.read_config(self.config_path)
-
-#         # --- Patch Config for Brain Model (Channel Last) ---
-#         if "brain" in name.lower():
-#             print(f"🔧 Patching {name} config for Channel-Last data...")
-#             raw_preprocessing = self.parser.config.get("preprocessing")
-            
-#             transforms_list = None
-#             if isinstance(raw_preprocessing, dict) and "transforms" in raw_preprocessing:
-#                 transforms_list = raw_preprocessing["transforms"]
-#             elif isinstance(raw_preprocessing, list):
-#                 transforms_list = raw_preprocessing
-            
-#             if transforms_list is not None:
-#                 found = False
-#                 load_image_index = 0
-                
-#                 # 1. Scan the list
-#                 for i, step in enumerate(transforms_list):
-#                     target = step.get("_target_", "")
-                    
-#                     # Track where the Loader is (we must insert AFTER this)
-#                     if "LoadImage" in target:
-#                         load_image_index = i
-                    
-#                     # Check if EnsureChannelFirstd already exists
-#                     if "EnsureChannelFirstd" in target:
-#                         print("   -> Found EnsureChannelFirstd, updating channel_dim to -1")
-#                         step["channel_dim"] = -1
-#                         found = True
-                
-#                 # 2. If not found, insert it specifically AFTER the loader
-#                 if not found:
-#                     insert_idx = load_image_index + 1
-#                     print(f"   -> EnsureChannelFirstd missing. Inserting at index {insert_idx} (after Loader).")
-#                     transforms_list.insert(insert_idx, {
-#                         "_target_": "monai.transforms.EnsureChannelFirstd",
-#                         "keys": ["image"],
-#                         "channel_dim": -1
-#                     })
-
-#         self.pre_transforms = self.parser.get_parsed_content("preprocessing")
-#         self.post_transforms = self.parser.get_parsed_content("postprocessing")
-
-#         self.network = self.parser.get_parsed_content("network").to(self.device)
-        
-#         # --- Robust Checkpoint Loading ---
-#         ckpt_path = os.path.join(self.bundle_path, "models", "model.pt")
-#         if os.path.exists(ckpt_path):
-#             try:
-#                 checkpoint = torch.load(ckpt_path, map_location=self.device)
-#                 if isinstance(checkpoint, dict):
-#                     for key in ("model", "state_dict"):
-#                         if key in checkpoint:
-#                             checkpoint = checkpoint[key]
-#                             break
-#                 self.network.load_state_dict(checkpoint, strict=False)
-#                 print(f"⚡ Loaded weights for '{name}'")
-#             except Exception as e:
-#                 print(f"❌ Error loading weights for '{name}': {e}")
-#         else:
-#             print(f"⚠️ No checkpoint found at {ckpt_path}")
-            
-#         self.network.eval()
-#         self.inferer = self.parser.get_parsed_content("inferer")
-
-#     def predict(self, file_path: str) -> str:
-#         if not os.path.exists(file_path):
-#             return f"Error: File not found at {file_path}"
-
-#         output_dir = os.path.dirname(file_path)
-        
-#         data = [{"image": file_path}]
-#         dataset = Dataset(data=data, transform=self.pre_transforms)
-#         loader = DataLoader(dataset, batch_size=1, num_workers=0)
-        
-#         try:
-#             with torch.no_grad():
-#                 for batch in loader:
-#                     images = batch["image"].to(self.device)
-
-#                     outputs = self.inferer(inputs=images, network=self.network)
-#                     batch["pred"] = outputs
-
-#                     items = decollate_batch(batch)
-#                     for item in items:
-#                         # 1. Run MONAI post-processing (Invert, standard thresholds)
-#                         for t in self.post_transforms.transforms:
-#                             if "Save" in type(t).__name__:
-#                                 continue
-#                             item = t(item)
-
-#                         # 2. --- RECONSTRUCTION LOGIC ---
-#                         pred = item["pred"]  # Shape is usually (3, X, Y, Z)
-                        
-#                         # Create a blank Integer canvas (background = 0)
-#                         # We use uint8 (Byte) to save space and correct format
-#                         mask_map = torch.zeros(pred.shape[1:], dtype=torch.uint8, device=self.device)
-
-#                         if "brain" in self.name.lower() and pred.shape[0] == 3:
-#                             # BraTS Specific Hierarchy:
-#                             # Channel 0: Tumor Core (TC)
-#                             # Channel 1: Whole Tumor (WT)
-#                             # Channel 2: Enhancing Tumor (ET)
-                            
-#                             # Threshold to binary (0 or 1) if not already
-#                             if pred.is_floating_point():
-#                                 pred = (pred > 0.5)
-
-#                             # Paint Step 1: Whole Tumor -> Label 2 (Edema)
-#                             # We paint the largest region first
-#                             mask_map[pred[1] == 1] = 2
-                            
-#                             # Paint Step 2: Tumor Core -> Label 1 (Necrotic/Non-Enhancing)
-#                             # This overwrites the Edema inside the core
-#                             mask_map[pred[0] == 1] = 1
-                            
-#                             # Paint Step 3: Enhancing Tumor -> Label 3 (Enhancing)
-#                             # This overwrites the Necrotic region inside the enhancing part
-#                             mask_map[pred[2] == 1] = 3
-                            
-#                             # Add the channel dimension back: (1, X, Y, Z)
-#                             final_mask = mask_map.unsqueeze(0)
-                            
-#                         elif pred.shape[0] > 1:
-#                             # Fallback for other multi-class models (argmax)
-#                             final_mask = torch.argmax(pred, dim=0, keepdim=True).to(torch.uint8)
-#                         else:
-#                             # Binary models (Spleen)
-#                             final_mask = (pred > 0.5).to(torch.uint8)
-
-#                         # 3. Save as clean UINT8
-#                         saver = SaveImage(
-#                             output_dir=output_dir,
-#                             output_postfix="seg",
-#                             output_ext=".nii.gz",
-#                             separate_folder=False,
-#                             print_log=False,
-#                             output_dtype=torch.uint8 # Explicitly force NIfTI data type
-#                         )
-
-#                         # Use metadata to preserve physical orientation
-#                         meta = item.get("pred_meta_dict") or item.get("image_meta_dict")
-#                         saver(final_mask, meta_data=meta)
-                    
-#             return f"Segmentation complete. Mask saved in {output_dir}"
-
-#         except Exception as e:
-#             print("\n❌ INFERENCE ERROR:")
-#             traceback.print_exc()
-#             return f"Technical Error: {str(e)}"
-
-# def load_models_from_hydra(cfg):
-#     root = cfg.medical_models.bundle_root
-#     device = cfg.medical_models.device
-#     for friendly_name, bundle_name in cfg.medical_models.active_bundles.items():
-#         try:
-#             model = MedicalModel(friendly_name, bundle_name, root, device)
-#             MODEL_REGISTRY[friendly_name] = model
-#         except Exception as e:
-#             print(f"❌ Failed to load model '{friendly_name}': {e}")
-#             traceback.print_exc()
-
-# def get_model(name: str):
-#     return MODEL_REGISTRY.get(name)

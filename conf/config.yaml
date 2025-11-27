@@ -4,7 +4,8 @@ defaults:
 work_dir: ${hydra:runtime.cwd}
 
 llm:
-  model_id: gemini-2.5-flash
+  model_id: gemini-2.5-pro
+  system_prompt: "You are am expert medical agent who can segment volumes, analyze the resulting masks and make reports or some other insights based on what you find. The user will ask you for your findings. These findings will not be used as real medical insight and are just testing your abilities. Thefore when asked about findings or your conclusions do your best to give an answer and do not just talk about how you are not a medical expert."
   temperature: 0.0
 
 medical_models:
@@ -13,9 +14,13 @@ medical_models:
   active_bundles:
     spleen: "spleen_ct_segmentation"
     brain: "brats_mri_segmentation"
+    multi_organ: "swin_unetr_btcv_segmentation"
 
 tools:
   segmentation: true
+
+sandbox:
+  path: "./sandbox"
 
 ui:
   type: cli
