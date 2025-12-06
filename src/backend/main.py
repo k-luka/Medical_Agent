@@ -1,40 +1,188 @@
+import os
+import re
+import shutil
+import json
+import logging
+from pathlib import Path
+from typing import List, Any, Optional
+
 import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.responses import FileResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
+from google import genai
+from google.genai import types
+from omegaconf import OmegaConf
 from pydantic import BaseModel
-from typing import List
 
-class Fruit(BaseModel):
-    name: str
+# Import your tools
+from src.tools.defenitions import (
+    init_paths,
+    inspect_segmentation_tool,
+    segment_multi_organ_ct,
+    segment_spleen_ct,
+    view_saved_slice,
+    view_saved_image,
+    list_sandbox_files,
+    search_web_medical,
+    run_python_analysis,
+)
+from src.tools.inference import load_models_from_hydra
 
-class Fruits(BaseModel):
-    fruits: List[Fruit]
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+class ChatRequest(BaseModel):
+    message: str
+
+def load_config() -> Any:
+    config_path = Path(__file__).resolve().parents[2] / "conf" / "config.yaml"
+    if not config_path.exists():
+        raise FileNotFoundError(f"Config not found at {config_path}")
+    return OmegaConf.load(config_path)
+
+def build_chat(client: genai.Client, cfg) -> Any:
+    tool_list: List = [
+        segment_spleen_ct,
+        segment_multi_organ_ct,
+        # lung_nodule_ct_detection, # Uncomment if using lung detection
+        inspect_segmentation_tool,
+        view_saved_slice,
+        view_saved_image,
+        list_sandbox_files,
+        search_web_medical,
+        run_python_analysis
+    ]
+    
+    # CRITICAL CHANGE: automatic_function_calling=True is usually fine for streaming 
+    # if using the specific streaming API, but to capture tool inputs manually for 
+    # status updates, we sometimes disable it.
+    # However, Gemini's Python SDK stream=True handles auto-tool calling well.
+    # We will use the native stream=True approach which is robust.
+    
+    generate_config = types.GenerateContentConfig(
+        temperature=cfg.llm.temperature,
+        tools=tool_list,
+        automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=False),
+        system_instruction="If you generate an image or file, explicitly mention its filename in your response."
+    )
+    return client.chats.create(model=cfg.llm.model_id, config=generate_config)
+
+# --- Init Setup ---
+cfg = load_config()
+load_models_from_hydra(cfg)
+
+sandbox_path = getattr(cfg.sandbox, "path", "./sandbox_data")
+SANDBOX_DIR = Path(str(sandbox_path)).resolve()
+SANDBOX_DIR.mkdir(parents=True, exist_ok=True)
+init_paths(SANDBOX_DIR)
+
+if "GEMINI_API_KEY" not in os.environ:
+    raise RuntimeError("GEMINI_API_KEY not found in environment variables.")
+client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+
+# Global Chat Session
+chat_session = build_chat(client, cfg)
 
 app = FastAPI()
 
-origins = [
-    "https://hvzl4zsm-5173.use2.devtunnels.ms",
-    "http://localhost:5173"
-]
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
+    allow_origins=["*"],
+    allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-memory_db = {"fruits": []}
+async def chat_stream_generator(user_message: str):
+    """
+    Yields chunks of data for the frontend to consume.
+    Structure: JSON strings separated by newlines.
+    """
+    try:
+        # 1. Yield initial status
+        yield json.dumps({"type": "status", "text": "Thinking..."}) + "\n"
 
-@app.get("/fruits", response_model=Fruits)
-def get_fruits():
-    return Fruits(fruits=memory_db["fruits"])
+        # 2. Send message with streaming enabled
+        yield json.dumps({"type": "status", "text": "Analyzing request..."}) + "\n"
+        
+        # This call might take 10-20 seconds. 
+        # In a production app we'd use a thread or async to keep yielding "..."
+        # For now, this blocks, but at least we sent the first "Thinking" packet.
+        response = chat_session.send_message(user_message)
+        
+        # 3. Check for Visuals (Post-Processing)
+        visual_file = None
+        
+        # Strategy A: Check Tool Outputs
+        try:
+            # We look at the candidates of the just-generated response
+            if response.candidates:
+                for part in response.candidates[0].content.parts:
+                    if hasattr(part, "function_response") and part.function_response:
+                        resp = part.function_response.response
+                        if isinstance(resp, dict) and "visual_file" in resp:
+                            visual_file = resp["visual_file"]
+        except Exception:
+            pass
 
-@app.post("/fruits", response_model=Fruit)
-def add_fruit(fruit: Fruit):
-    memory_db["fruits"].append(fruit)
-    return fruit
+        # Strategy B: Regex Fallback
+        if not visual_file:
+            match = re.search(r'(vis_[\w.-]+\.png)', response.text)
+            if match:
+                visual_file = match.group(1)
+
+        # 4. Yield Final Result
+        yield json.dumps({
+            "type": "reply",
+            "text": response.text,
+            "visual_file": visual_file
+        }) + "\n"
+
+    except Exception as e:
+        logger.error(f"Stream error: {e}")
+        yield json.dumps({"type": "reply", "text": f"Error: {str(e)}"}) + "\n"
+
+@app.post("/chat")
+async def chat(req: ChatRequest):
+    # We return a StreamingResponse!
+    return StreamingResponse(
+        chat_stream_generator(req.message),
+        media_type="application/x-ndjson"
+    )
+
+@app.post("/reset")
+def reset_chat():
+    global chat_session
+    chat_session = build_chat(client, cfg)
+    return {"status": "success", "message": "Chat history cleared."}
+
+@app.post("/upload")
+async def upload_file(file: UploadFile = File(...)):
+    try:
+        filename = file.filename
+        file_path = SANDBOX_DIR / filename
+        with open(file_path, "wb") as buffer:
+            shutil.copyfileobj(file.file, buffer)
+        return {"filename": filename, "status": "success"}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/image/{filename}")
+def get_image(filename: str):
+    try:
+        safe_path = (SANDBOX_DIR / filename).resolve()
+        logger.info(f"Serving image: {safe_path}")
+        
+        if not str(safe_path).startswith(str(SANDBOX_DIR)):
+            raise HTTPException(status_code=403, detail="Access denied")
+        if not safe_path.exists():
+            raise HTTPException(status_code=404, detail="File not found")
+        return FileResponse(safe_path)
+    except Exception as e:
+        logger.error(f"Image error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8000)

@@ -1,6 +1,27 @@
 .env
+.env.local
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.coverage
+.DS_Store
+.idea/
+.vscode/
+
 models/
 data/
 demo/
 outputs/
-__pycache__/
+sandbox/
+
+# Node/Vite artifacts
+node_modules/
+dist/
+
+# Frontend lockfiles and logs (keep package.json/lock tracked)
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
