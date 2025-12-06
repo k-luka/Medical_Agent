@@ -109,7 +109,8 @@ class MedicalAnalyzer:
         plt.axis("off")
         plt.title(f"Slice {z_idx}")
 
-        output_filename = f"vis_{mask_path.stem}.png"
+        base_name = mask_path.name.split(".")[0]  # avoid double extensions like .nii.gz
+        output_filename = f"vis_{base_name}.png"
         output_path = self.sandbox_dir / output_filename
         plt.savefig(output_path, bbox_inches="tight", pad_inches=0)
         plt.close()

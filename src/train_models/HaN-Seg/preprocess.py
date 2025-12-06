@@ -26,7 +26,7 @@ def read_clean_image(path):
     """
     img = sitk.ReadImage(path)
     
-    # 1. Fix Dimensions: If 4D, convert to 3D
+    # Fix dimensions: if 4D, convert to 3D
     if img.GetDimension() == 4:
         # Check if the 4th dimension is actually 1 (singleton)
         if img.GetSize()[3] == 1:
@@ -37,7 +37,7 @@ def read_clean_image(path):
             print(f"Warning: {path} is 4D {img.GetSize()}. Using first volume.")
             img = img[:, :, :, 0]
             
-    # 2. Fix Type: Registration works best with Float32
+    # Fix type: registration works best with Float32
     img = sitk.Cast(img, sitk.sitkFloat32)
     
     return img
@@ -83,7 +83,7 @@ def process_case(case_id):
     ct_path = os.path.join(case_dir, f"{case_id}_IMG_CT.nrrd")
     mr_path = os.path.join(case_dir, f"{case_id}_IMG_MR_T1.nrrd")
     
-    # 1. Load CT & MRI using the new Safe Reader
+    # Load CT & MRI using the new safe reader
     # ---------------------------------------------
     ct_img = read_clean_image(ct_path)
     
@@ -95,7 +95,7 @@ def process_case(case_id):
         print(f"Warning: No MRI for {case_id}")
         return
 
-    # 2. Merge Labels (Logic remains mostly the same, just ensure 3D output)
+    # Merge labels (logic remains mostly the same, just ensure 3D output)
     label_map_np = np.zeros(sitk.GetArrayFromImage(ct_img).shape, dtype=np.uint8)
     
     for idx, oar in enumerate(OAR_NAMES, start=1):
@@ -115,7 +115,7 @@ def process_case(case_id):
     final_label = sitk.GetImageFromArray(label_map_np)
     final_label.CopyInformation(ct_img)
 
-    # 3. Save
+    # Save outputs
     sitk.WriteImage(ct_img, os.path.join(OUTPUT_ROOT, f"{case_id}_ct.nii.gz"))
     sitk.WriteImage(mr_reg, os.path.join(OUTPUT_ROOT, f"{case_id}_mr.nii.gz"))
     sitk.WriteImage(final_label, os.path.join(OUTPUT_ROOT, f"{case_id}_label.nii.gz"))

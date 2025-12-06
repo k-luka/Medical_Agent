@@ -4,7 +4,7 @@ import traceback
 from pathlib import Path
 import numpy as np
 import torch
-from typing import Any, Dict, List, cast
+from typing import Any, Dict, List, cast, Optional
 
 from monai.bundle.config_parser import ConfigParser
 from monai.data.dataloader import DataLoader
@@ -16,6 +16,24 @@ from monai.transforms.io.array import SaveImage
 
 # Configure logging
 logger = logging.getLogger(__name__)
+
+# --- NEW: BTCV Label Mapping ---
+# Maps organ names to the integer pixel value in the multi-organ model
+BTCV_LABELS = {
+    "spleen": 1,
+    "right kidney": 2,
+    "left kidney": 3,
+    "gallbladder": 4,
+    "esophagus": 5,
+    "liver": 6,
+    "stomach": 7,
+    "aorta": 8,
+    "ivc": 9,
+    "portal_vein": 10,
+    "pancreas": 11,
+    "right_adrenal": 12,
+    "left_adrenal": 13
+}
 
 # --- 1. Base Class (Shared Logic) ---
 class MedicalModel:
@@ -61,8 +79,8 @@ class MedicalModel:
         transforms = self.parser.get_parsed_content("postprocessing")
         return transforms if isinstance(transforms, Compose) else Compose([])
 
-    # Explicit return type 'str' fixes the inheritance conflict
-    def predict(self, file_path: str) -> str:
+    # Updated signature to accept kwargs (like target_organs)
+    def predict(self, file_path: str, **kwargs) -> str:
         raise NotImplementedError("Subclasses must implement predict()")
 
 
@@ -76,7 +94,8 @@ class SegmentationModel(MedicalModel):
             return Compose(clean)
         return transforms
 
-    def predict(self, file_path: str) -> str:
+    # UPDATED: predict now accepts target_organs
+    def predict(self, file_path: str, target_organs: Optional[List[str]] = None) -> str:
         path = Path(file_path)
         output_dir = path.parent
         
@@ -89,15 +108,15 @@ class SegmentationModel(MedicalModel):
                 images = batch["image"].to(self.device)
                 batch["pred"] = self.inferer(inputs=images, network=self.network)
                 
-                # --- FIX: Explicit Cast for Type Checker ---
                 items = cast(List[Dict[str, Any]], decollate_batch(batch))
 
                 for item in items:
-                    self._save_mask(item, output_dir)
+                    # Pass target_organs to the save function
+                    self._save_mask(item, output_dir, target_organs)
         
         return f"Segmentation complete. Mask saved in {output_dir}"
 
-    def _save_mask(self, item: Dict[str, Any], output_dir: Path):
+    def _save_mask(self, item: Dict[str, Any], output_dir: Path, target_organs: Optional[List[str]] = None):
         if self.post_transforms:
             item = cast(Dict[str, Any], self.post_transforms(item))
         
@@ -106,18 +125,43 @@ class SegmentationModel(MedicalModel):
         if mask.shape[0] > 1: 
             mask = torch.argmax(mask, dim=0, keepdim=True)
         
+        # --- NEW: FILTERING LOGIC ---
+        # Only run if we are in the multi-organ model and targets are specified
+        postfix = "seg"
+        
+        if target_organs and "multi_organ" in self.name:
+            # Create a blank mask (all zeros/background)
+            filtered_mask = torch.zeros_like(mask)
+            found_targets = []
+
+            for organ_name in target_organs:
+                clean_name = organ_name.lower().strip().replace("_", " ") # handle 'right_kidney' vs 'right kidney'
+                # Check standard dict or try replacing underscore
+                label_id = BTCV_LABELS.get(clean_name) or BTCV_LABELS.get(clean_name.replace(" ", "_"))
+                
+                if label_id:
+                    # Copy pixels matching this ID
+                    filtered_mask[mask == label_id] = label_id
+                    found_targets.append(clean_name[:3]) # Keep first 3 letters for filename
+            
+            if found_targets:
+                mask = filtered_mask
+                postfix = f"seg_{'_'.join(found_targets)}"
+            else:
+                print(f"⚠️ Warning: No valid organs found in request {target_organs}. Saving full mask.")
+
         # Ensure uint8
         if mask.dtype != torch.uint8:
              mask = mask.to(torch.uint8)
 
-        saver = SaveImage(output_dir=str(output_dir), output_postfix="seg", output_ext=".nii.gz", 
+        saver = SaveImage(output_dir=str(output_dir), output_postfix=postfix, output_ext=".nii.gz", 
                           separate_folder=False, print_log=False, output_dtype=np.uint8)
         saver(mask, meta_data=item.get("image_meta_dict"))
 
 
 # --- 3. Detection Subclass ---
 class DetectionModel(MedicalModel):
-    def predict(self, file_path: str) -> str:
+    def predict(self, file_path: str, **kwargs) -> str:
         path = Path(file_path)
         output_json = path.parent / f"{path.stem}_detection.json"
         
@@ -129,18 +173,17 @@ class DetectionModel(MedicalModel):
             for batch in loader:
                 images = batch["image"].to(self.device)
                 
-                # 1. Inference
+                # Inference
                 batch["pred"] = self.inferer(inputs=images, network=self.network)
                 
-                # --- FIX: Explicit Cast for Type Checker ---
                 items = cast(List[Dict[str, Any]], decollate_batch(batch))
 
-                # 3. Post-Processing
+                # Post-processing
                 for item in items:
                     if self.post_transforms:
                         item = cast(Dict[str, Any], self.post_transforms(item))
                     
-                    # 4. Extract Results
+                    # Extract results
                     if "box" in item and "label" in item and "score" in item:
                         boxes = item["box"].cpu().numpy().tolist()
                         scores = item["score"].cpu().numpy().tolist()
@@ -190,4 +233,3 @@ def load_models_from_hydra(cfg):
 
 def get_model(name: str):
     return MODEL_REGISTRY.get(name)
-

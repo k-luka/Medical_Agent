@@ -7,7 +7,7 @@ def main():
 
     print("🚀 Downloading MONAI Bundles... (This saves the 'Brains' of your agent)")
 
-    # # 1. Spleen Model (CT)
+    # # Spleen Model (CT)
     # # This creates: models/spleen_ct_segmentation/configs/inference.json
     # print("\n--- Downloading Spleen Model ---")
     # download(
@@ -16,7 +16,7 @@ def main():
     #     version="0.1.0" # Pinning version for stability
     # )
 
-    # # 2. Brain Tumor Model (MRI)
+    # # Brain Tumor Model (MRI)
     # # This creates: models/brats_mri_segmentation/configs/inference.json
     # print("\n--- Downloading Brain Tumor Model ---")
     # download(

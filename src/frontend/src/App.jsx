@@ -1,18 +1,11 @@
-import React from 'react';
-import './App.css';
-import FruitList from './components/Fruits';
+import Chat from "./components/Chat";
 
-const App = () => {
+function App() {
   return (
-    <div className="App">
-      <header className="App-header">
-        <h1>Fruit Management App</h1>
-      </header>
-      <main>
-        <FruitList />
-      </main>
+    <div className="h-screen w-full">
+      <Chat />
     </div>
   );
-};
+}
 
 export default App;

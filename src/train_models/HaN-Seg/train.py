@@ -20,13 +20,13 @@ from monai.transforms import (
 
 def get_train_transforms():
     return Compose([
-        # 1. Load raw data
+        # Load raw data
         LoadImaged(keys=["image_ct", "image_mr", "label"]),
         
         # SAFELY add channel dim (B, C, D, H, W)
         EnsureChannelFirstd(keys=["image_ct", "image_mr", "label"], channel_dim="no_channel"),
 
-        # 2. NORMALIZE CT (Absolute Physics Values)
+        # Normalize CT (absolute physics values)
         # CT is always consistent: -150 is soft tissue, 1000 is bone.
         ScaleIntensityRanged(
             keys=["image_ct"], 
@@ -35,7 +35,7 @@ def get_train_transforms():
             clip=True
         ),
 
-        # 3. NORMALIZE MRI (Adaptive Relative Values) - CHANGED THIS BLOCK
+        # Normalize MRI (adaptive relative values)
         # This finds the bottom 0.5% and top 99.5% of intensities and scales them to 0-1.
         # It handles your 35,000 max value automatically.
         ScaleIntensityRangePercentilesd(
@@ -46,11 +46,11 @@ def get_train_transforms():
             relative=False
         ),
 
-        # 4. Combine into Multi-Modal Input (Channel 0=CT, Channel 1=MRI)
+        # Combine into multi-modal input (Channel 0=CT, Channel 1=MRI)
         ConcatItemsd(keys=["image_ct", "image_mr"], name="image", dim=0),
         DeleteItemsd(keys=["image_ct", "image_mr"]),
 
-        # 5. Spatial Transforms (Crop, Zoom, Rotate)
+        # Spatial transforms (crop, zoom, rotate)
         # Note: We crop on 'image' (the combined pair) so CT/MRI stay aligned
         CropForegroundd(keys=["image", "label"], source_key="image"),
         
@@ -73,32 +73,32 @@ def get_train_transforms():
 def get_val_transforms():
     """
     Validation transforms:
-    1. Same loading and normalization as training.
-    2. NO random crops (we use sliding window on the full volume).
-    3. NO random flips/rotations.
+    - Same loading and normalization as training.
+    - No random crops (sliding window on the full volume).
+    - No random flips/rotations.
     """
     return Compose([
-        # 1. Load
+        # Load
         LoadImaged(keys=["image_ct", "image_mr", "label"]),
         EnsureChannelFirstd(keys=["image_ct", "image_mr", "label"], channel_dim="no_channel"),
 
-        # 2. Normalize CT
+        # Normalize CT
         ScaleIntensityRanged(
             keys=["image_ct"], a_min=-150, a_max=250, 
             b_min=0.0, b_max=1.0, clip=True
         ),
 
-        # 3. Normalize MRI (Same Percentiles as Training)
+        # Normalize MRI (same percentiles as training)
         ScaleIntensityRangePercentilesd(
             keys=["image_mr"], lower=0.5, upper=99.5, 
             b_min=0.0, b_max=1.0, clip=True, relative=False
         ),
 
-        # 4. Concat
+        # Concat
         ConcatItemsd(keys=["image_ct", "image_mr"], name="image", dim=0),
         DeleteItemsd(keys=["image_ct", "image_mr"]),
 
-        # 5. Crop Foreground (Optional but recommended to remove empty air)
+        # Crop foreground (optional but recommended to remove empty air)
         CropForegroundd(keys=["image", "label"], source_key="image"),
         
         # Note: NO RandSpatialCropd here! We validate on the full (cropped) volume.
@@ -107,9 +107,9 @@ def get_val_transforms():
 
 def create_dataloaders(batch_size=4, num_workers=4, val_split=0.2):
     """
-    1. Gets the list of files.
-    2. Splits them into Train/Val.
-    3. Creates MONAI Datasets and PyTorch DataLoaders.
+    - Get the list of files.
+    - Split into train/val.
+    - Create MONAI datasets and PyTorch dataloaders.
     """
     full_data_list = build_datalist()
     
@@ -252,7 +252,7 @@ def run_training():
     print(f"--- Starting HaN-Seg Training on {DEVICE} ---")
     train_loader, val_loader = create_dataloaders(batch_size=4, num_workers=4)
     
-    # 2. Setup Model, Loss, Optimizer
+    # Setup model, loss, optimizer
     model = get_model()
     
     loss_function = DiceCELoss(to_onehot_y=True, softmax=True, include_background=False)
@@ -281,7 +281,7 @@ def run_training():
     # Metric: ignore background (index 0) so we measure organ performance only
     dice_metric = DiceMetric(include_background=False, reduction="mean", get_not_nans=False)
 
-    # 3. Main Loop
+    # Main loop
     best_metric = -1
     best_metric_epoch = -1
 

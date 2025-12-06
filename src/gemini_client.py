@@ -12,8 +12,8 @@ from src.tools.defenitions import (
     segment_multi_organ_ct,
     lung_nodule_ct_detection,
     inspect_segmentation_tool,
-    view_saved_slice,
-    init_analysis,
+    view_saved_image,
+    init_paths,
 )
 
 warnings.filterwarnings("ignore", module="monai")
@@ -28,7 +28,7 @@ def main(cfg: DictConfig):
 
     # load models
     load_models_from_hydra(cfg)
-    init_analysis(Path(cfg.sandbox.path))
+    init_paths(Path(cfg.sandbox.path))
 
     if "GEMINI_API_KEY" not in os.environ:
         raise ValueError("GEMINI_API_KEY not found in environment variables.")
@@ -43,7 +43,7 @@ def main(cfg: DictConfig):
         segment_multi_organ_ct,
         lung_nodule_ct_detection,
         inspect_segmentation_tool,
-        view_saved_slice,
+        view_saved_image,
     ]
 
     generate_config = types.GenerateContentConfig(
